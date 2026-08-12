@@ -1,0 +1,423 @@
+// =====================================================
+// 📦 INVENTORY MANAGEMENT SYSTEM — Code.gs
+// Google Apps Script Backend
+// Paste this into your Apps Script project as Code.gs
+// =====================================================
+
+const INV_SHEET = 'Inventory';
+const TXN_SHEET = 'Transactions';
+
+// Column index (1-based) of columns in the Inventory sheet.
+// Inventory sheet layout is now: Barcode | Name | Quantity | Location
+const BARCODE_COL  = 1;
+const NAME_COL     = 2;
+const QTY_COL      = 3;
+const LOCATION_COL = 4;
+
+// The Transactions sheet still has its own Barcode column at index 3
+// (Date&Time | Item Name | Barcode | Type | Borrowed Qty | Current Qty)
+const TXN_BARCODE_COL = 3;
+
+// ---------- Web App Entry Point ----------
+// If the request includes ?callback=... it's a JSONP API call coming from
+// an externally-hosted page (see standalone.html). Otherwise, serve the
+// normal HtmlService UI (Index.html) as before.
+function doGet(e) {
+  if (e && e.parameter && e.parameter.callback) {
+    return handleApiRequest_(e);
+  }
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('📦 Inventory System')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1.0')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+// ---------- JSONP API dispatcher (for standalone.html) ----------
+// Using JSONP (a <script> tag pointing at this URL) instead of fetch()
+// sidesteps CORS entirely, since Apps Script doesn't reliably set
+// Access-Control-Allow-Origin headers for cross-origin fetch requests.
+//
+// IMPORTANT — for every phone to be able to call this without asking you
+// for permission each time, this project must be deployed as:
+//   Deploy ▸ New deployment ▸ Web app
+//     Execute as:  Me (your account)
+//     Who has access:  Anyone
+// "Anyone" (not "Anyone with Google account") is what lets other phones
+// hit this URL without ever logging in or requesting access — the script
+// itself runs with YOUR permissions on the Spreadsheet, so the caller
+// never needs their own access to the underlying Google Sheet at all.
+function handleApiRequest_(e) {
+  const callback = e.parameter.callback;
+  const action   = e.parameter.action;
+  let result;
+  try {
+    switch (action) {
+      case 'getInventory':      result = getInventory(); break;
+      case 'getTransactions':   result = getTransactions(); break;
+      case 'getSheetUrl':       result = getSheetUrl(); break;
+      case 'exportCsv':         result = exportInventoryCsv(); break;
+      case 'findByBarcode':     result = findByBarcode(e.parameter.barcode || ''); break;
+      case 'addOrUpdateItem':   result = addOrUpdateItem(JSON.parse(e.parameter.data || '{}')); break;
+      case 'updateItemFull':    result = updateItemFull(JSON.parse(e.parameter.data || '{}')); break;
+      case 'deleteItem':        result = deleteItem(e.parameter.id || ''); break;
+      case 'processTransaction':result = processTransaction(JSON.parse(e.parameter.data || '{}')); break;
+      default: result = { success: false, error: 'Unknown action: ' + action };
+    }
+  } catch (err) {
+    result = { success: false, error: String(err && err.message || err) };
+  }
+  const body = callback + '(' + JSON.stringify(result) + ');';
+  return ContentService.createTextOutput(body).setMimeType(ContentService.MimeType.JAVASCRIPT);
+}
+
+// ---------- Sheet Initialization ----------
+function setupSheets_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // ----- Inventory sheet (no ID column) -----
+  // Column order: Barcode | Name | Quantity | Location
+  let inv = ss.getSheetByName(INV_SHEET);
+  if (!inv) {
+    inv = ss.insertSheet(INV_SHEET);
+    inv.appendRow(['Barcode', 'Name', 'Quantity', 'Location']);
+    inv.getRange(1, 1, 1, 4)
+      .setFontWeight('bold')
+      .setBackground('#1a73e8')
+      .setFontColor('#ffffff');
+    inv.setFrozenRows(1);
+    inv.setColumnWidths(1, 4, [160, 200, 100, 160]);
+  }
+  // Force the whole Barcode column (A) to PLAIN TEXT so "0001" stays "0001"
+  inv.getRange('A:A').setNumberFormat('@');
+
+  // ----- Transactions sheet (unchanged, no TXN ID) -----
+  let txn = ss.getSheetByName(TXN_SHEET);
+  if (!txn) {
+    txn = ss.insertSheet(TXN_SHEET);
+    txn.appendRow(['Date & Time', 'Item Name', 'Barcode', 'Type', 'Borrowed Qty', 'Current Qty']);
+    txn.getRange(1, 1, 1, 6)
+      .setFontWeight('bold')
+      .setBackground('#34a853')
+      .setFontColor('#ffffff');
+    txn.setFrozenRows(1);
+    txn.setColumnWidths(1, 6, [160, 200, 160, 90, 110, 110]);
+  }
+  // Force the Barcode column (C) to PLAIN TEXT here too
+  txn.getRange('C:C').setNumberFormat('@');
+
+  // ----- Remove the default "Sheet1" / "工作表1" tab -----
+  // Google Sheets always creates one default sheet when a spreadsheet is
+  // first made. Once our real Inventory/Transactions sheets exist we don't
+  // need it, so clean it up automatically (only if it's still empty, and
+  // only if there's another sheet left to keep — a spreadsheet can't have
+  // zero sheets).
+  ['Sheet1', '工作表1'].forEach(function(defaultName) {
+    const def = ss.getSheetByName(defaultName);
+    if (def && ss.getSheets().length > 1 && def.getLastRow() === 0 && def.getLastColumn() === 0) {
+      ss.deleteSheet(def);
+    }
+  });
+}
+
+// =====================================================
+// BARCODE HELPERS — keep leading zeros ("0001" != "1")
+// =====================================================
+
+function normalizeBarcode_(value) {
+  if (value === null || value === undefined) return '';
+  return String(value).trim();
+}
+
+function setBarcodeCell_(sheet, row, barcode) {
+  const cell = sheet.getRange(row, BARCODE_COL);
+  cell.setNumberFormat('@');
+  cell.setValue(normalizeBarcode_(barcode));
+}
+
+function setTxnBarcodeCell_(sheet, row, barcode) {
+  const cell = sheet.getRange(row, TXN_BARCODE_COL);
+  cell.setNumberFormat('@');
+  cell.setValue(normalizeBarcode_(barcode));
+}
+
+// =====================================================
+// INVENTORY CRUD
+// Note: there is no "ID" column anymore. The sheet ROW NUMBER
+// is used as the item's id (returned as a string), which is
+// simpler and still unique per item.
+//
+// Column order: Barcode(1) | Name(2) | Quantity(3) | Location(4)
+// =====================================================
+
+function getInventory() {
+  try {
+    const ss    = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(INV_SHEET);
+    if (!sheet) { setupSheets_(); return []; }
+
+    const lr = sheet.getLastRow();
+    if (lr < 2) return [];
+
+    return sheet.getRange(2, 1, lr - 1, 4).getValues()
+      .map(function(r, i) { return { row: i + 2, r: r }; })
+      .filter(function(o) { return o.r[0] || o.r[1]; })
+      .map(function(o) {
+        const r = o.r;
+        return {
+          id       : String(o.row),
+          barcode  : normalizeBarcode_(r[0]),
+          name     : String(r[1]),
+          quantity : Number(r[2]  || 0),
+          location : String(r[3] || '')
+        };
+      });
+  } catch (e) {
+    return [];
+  }
+}
+
+function addOrUpdateItem(data) {
+  try {
+    setupSheets_();
+    const ss    = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(INV_SHEET);
+    const lr    = sheet.getLastRow();
+    const qty   = Number(data.quantity) || 0;
+    const inBc  = normalizeBarcode_(data.barcode);
+
+    if (lr >= 2) {
+      const rows = sheet.getRange(2, 1, lr - 1, 4).getValues();
+      const inNm = String(data.name || '').trim().toLowerCase();
+
+      for (let i = 0; i < rows.length; i++) {
+        const rowBc = normalizeBarcode_(rows[i][0]);
+        const rowNm = String(rows[i][1] || '').trim().toLowerCase();
+        const match = (inBc && rowBc && rowBc === inBc) ||
+                      (!inBc && inNm && rowNm === inNm);
+
+        if (match) {
+          const cur = Number(rows[i][2] || 0);
+          const nq  = cur + qty;
+          sheet.getRange(i + 2, QTY_COL).setValue(nq);
+          if (data.location) sheet.getRange(i + 2, LOCATION_COL).setValue(data.location);
+          return { success: true, action: 'updated', id: String(i + 2), name: rows[i][1], previousQty: cur, newQty: nq };
+        }
+      }
+    }
+
+    const newRow = sheet.getLastRow() + 1;
+    sheet.getRange(newRow, 1, 1, 4).setValues([[
+      '', data.name, qty, data.location || ''
+    ]]);
+    setBarcodeCell_(sheet, newRow, inBc);
+
+    return { success: true, action: 'added', id: String(newRow), name: data.name };
+  } catch (e) {
+    return { success: false, error: 'Save failed: ' + e.message };
+  }
+}
+
+function updateItemFull(data) {
+  try {
+    const ss    = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(INV_SHEET);
+    const lr    = sheet.getLastRow();
+    if (lr < 2) return { success: false, error: 'No items' };
+
+    const row = Number(data.id);
+    if (!row || row < 2 || row > lr) return { success: false, error: 'Item not found' };
+
+    sheet.getRange(row, NAME_COL).setValue(data.name);
+    sheet.getRange(row, LOCATION_COL).setValue(data.location || '');
+    sheet.getRange(row, QTY_COL).setValue(Number(data.quantity) || 0);
+    setBarcodeCell_(sheet, row, data.barcode);
+
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: 'Save failed: ' + e.message };
+  }
+}
+
+function deleteItem(id) {
+  try {
+    const ss    = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(INV_SHEET);
+    const lr    = sheet.getLastRow();
+    if (lr < 2) return { success: false, error: 'No items' };
+
+    const row = Number(id);
+    if (row && row >= 2 && row <= lr) {
+      sheet.deleteRow(row);
+      return { success: true };
+    }
+    return { success: false, error: 'Item not found' };
+  } catch (e) {
+    return { success: false, error: 'Delete failed: ' + e.message };
+  }
+}
+
+function findByBarcode(bc) {
+  try {
+    const ss    = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(INV_SHEET);
+    const lr    = sheet.getLastRow();
+    if (lr < 2) return null;
+
+    const target = normalizeBarcode_(bc);
+    if (!target) return null;
+
+    const rows = sheet.getRange(2, 1, lr - 1, 4).getValues();
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      if (normalizeBarcode_(r[0]) === target) {
+        return {
+          id       : String(i + 2),
+          barcode  : normalizeBarcode_(r[0]),
+          name     : String(r[1]),
+          quantity : Number(r[2] || 0),
+          location : String(r[3] || '')
+        };
+      }
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// =====================================================
+// TRANSACTIONS (Borrow & Return)
+// =====================================================
+
+function processTransaction(data) {
+  try {
+    setupSheets_();
+    const ss    = SpreadsheetApp.getActiveSpreadsheet();
+    const invSh = ss.getSheetByName(INV_SHEET);
+    const txnSh = ss.getSheetByName(TXN_SHEET);
+    const lr    = invSh.getLastRow();
+
+    if (lr < 2) return { success: false, error: 'Inventory is empty' };
+
+    const rows  = invSh.getRange(2, 1, lr - 1, 4).getValues();
+    const inBc  = normalizeBarcode_(data.barcode);
+    let ri = -1, cur = 0, nm = '', bc = '';
+
+    for (let i = 0; i < rows.length; i++) {
+      const rId = String(i + 2);
+      const rBc = normalizeBarcode_(rows[i][0]);
+      if ((data.id && rId === String(data.id)) ||
+          (inBc && rBc === inBc)) {
+        ri  = i + 2;
+        cur = Number(rows[i][2] || 0);
+        nm  = rows[i][1];
+        bc  = normalizeBarcode_(rows[i][0]);
+        break;
+      }
+    }
+
+    if (ri === -1) return { success: false, error: 'Item not found' };
+
+    const qty = Number(data.quantity) || 0;
+    let nq;
+
+    if (data.type === 'borrow') {
+      if (qty > cur) return { success: false, error: 'Only ' + cur + ' available' };
+      nq = cur - qty;
+    } else {
+      nq = cur + qty;
+    }
+
+    invSh.getRange(ri, QTY_COL).setValue(nq);
+
+    const tz  = Session.getScriptTimeZone();
+    const now = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm:ss');
+
+    const txnRow = txnSh.getLastRow() + 1;
+    txnSh.getRange(txnRow, 1, 1, 6).setValues([[
+      now,
+      nm,
+      '',
+      data.type === 'borrow' ? 'Borrow' : 'Return',
+      qty,
+      nq
+    ]]);
+    setTxnBarcodeCell_(txnSh, txnRow, bc);
+
+    return { success: true, newQty: nq, itemName: nm, type: data.type };
+  } catch (e) {
+    return { success: false, error: 'Operation failed: ' + e.message };
+  }
+}
+
+function getTransactions() {
+  try {
+    const ss    = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(TXN_SHEET);
+    if (!sheet) return [];
+
+    const lr = sheet.getLastRow();
+    if (lr < 2) return [];
+
+    return sheet.getRange(2, 1, lr - 1, 6).getValues()
+      .filter(function(r) { return r[0]; })
+      .map(function(r) {
+        return {
+          date      : String(r[0] || ''),
+          itemName  : String(r[1] || ''),
+          barcode   : normalizeBarcode_(r[2]),
+          type      : String(r[3] || ''),
+          quantity  : Number(r[4] || 0),
+          currentQty: Number(r[5] || 0)
+        };
+      })
+      .reverse();
+  } catch (e) {
+    return [];
+  }
+}
+
+// =====================================================
+// EXPORT — lets any phone download the WHOLE workbook
+// (Inventory + Transactions, as native Excel tabs) as a
+// single .xlsx file directly from the web app.
+//
+// This reads this spreadsheet as a Drive file and converts
+// it straight to Excel format. It needs Drive access to this
+// one file (the "drive.file" scope in appsscript.json), which
+// this project now accepts.
+// =====================================================
+function exportInventoryCsv() {
+  try {
+    const ss    = SpreadsheetApp.getActiveSpreadsheet();
+    const url   = 'https://docs.google.com/spreadsheets/d/' + ss.getId() + '/export?format=xlsx';
+    const token = ScriptApp.getOAuthToken();
+
+    const response = UrlFetchApp.fetch(url, {
+      headers: { 'Authorization': 'Bearer ' + token },
+      muteHttpExceptions: true
+    });
+
+    const code = response.getResponseCode();
+    if (code !== 200) {
+      return {
+        success: false,
+        error: 'Export failed: HTTP ' + code + ' — ' + response.getContentText().substring(0, 200)
+      };
+    }
+
+    const blob = response.getBlob();
+    const tz = Session.getScriptTimeZone();
+    const filename = 'inventory_export_' + Utilities.formatDate(new Date(), tz, 'yyyyMMdd_HHmmss') + '.xlsx';
+    const base64 = Utilities.base64Encode(blob.getBytes());
+
+    return { success: true, filename: filename, base64: base64 };
+  } catch (e) {
+    return { success: false, error: 'Export failed: ' + e.message };
+  }
+}
+
+// ---------- Utility ----------
+function getSheetUrl() {
+  return SpreadsheetApp.getActiveSpreadsheet().getUrl();
+}
